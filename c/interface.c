@@ -114,13 +114,106 @@ void js_std_dump_error(JSContext *ctx);
 #define IntrinsicsFlags enum QTS_Intrinsic
 #define EvalDetectModule int
 
-// Forward declarations for EM_JS callback functions
-// These are implemented via EM_JS macro but need forward declarations for C99 compliance
-#ifdef __EMSCRIPTEN__
-JSValue *qts_host_call_function(JSContext *ctx, JSValueConst *this_ptr, int argc, JSValueConst *argv, int32_t host_ref_id);
+typedef JSValue *(*qts_host_call_function_callback_t)(
+    JSContext *ctx, JSValueConst *this_ptr, int argc, JSValueConst *argv, HostRefId host_ref_id);
+typedef int (*qts_host_interrupt_handler_callback_t)(JSRuntime *rt);
+typedef char *(*qts_host_load_module_source_callback_t)(
+    JSRuntime *rt, JSContext *ctx, const char *module_name);
+typedef char *(*qts_host_normalize_module_callback_t)(
+    JSRuntime *rt, JSContext *ctx, const char *module_base_name, const char *module_name);
+typedef void (*qts_host_ref_free_callback_t)(JSRuntime *rt, HostRefId id);
+
+// Forward declarations for C -> host callback bridge functions.
+// In Emscripten builds these are implemented with EM_JS.
+// In native builds these dispatch to callback pointers registered via qts_set_host_callbacks.
+JSValue *qts_host_call_function(
+    JSContext *ctx, JSValueConst *this_ptr, int argc, JSValueConst *argv, HostRefId host_ref_id);
 int qts_host_interrupt_handler(JSRuntime *rt);
 char *qts_host_load_module_source(JSRuntime *rt, JSContext *ctx, const char *module_name);
-char *qts_host_normalize_module(JSRuntime *rt, JSContext *ctx, const char *module_base_name, const char *module_name);
+char *qts_host_normalize_module(
+    JSRuntime *rt, JSContext *ctx, const char *module_base_name, const char *module_name);
+void qts_host_ref_free(JSRuntime *rt, HostRefId id);
+
+#ifndef __EMSCRIPTEN__
+static qts_host_call_function_callback_t qts_host_call_function_callback = NULL;
+static qts_host_interrupt_handler_callback_t qts_host_interrupt_handler_callback = NULL;
+static qts_host_load_module_source_callback_t qts_host_load_module_source_callback = NULL;
+static qts_host_normalize_module_callback_t qts_host_normalize_module_callback = NULL;
+static qts_host_ref_free_callback_t qts_host_ref_free_callback = NULL;
+
+void qts_set_host_callbacks(
+    qts_host_call_function_callback_t call_function,
+    qts_host_interrupt_handler_callback_t should_interrupt,
+    qts_host_load_module_source_callback_t load_module_source,
+    qts_host_normalize_module_callback_t normalize_module,
+    qts_host_ref_free_callback_t free_host_ref) {
+  qts_host_call_function_callback = call_function;
+  qts_host_interrupt_handler_callback = should_interrupt;
+  qts_host_load_module_source_callback = load_module_source;
+  qts_host_normalize_module_callback = normalize_module;
+  qts_host_ref_free_callback = free_host_ref;
+}
+
+void qts_set_host_call_function_callback(
+    qts_host_call_function_callback_t callback) {
+  qts_host_call_function_callback = callback;
+}
+
+void qts_set_host_interrupt_handler_callback(
+    qts_host_interrupt_handler_callback_t callback) {
+  qts_host_interrupt_handler_callback = callback;
+}
+
+void qts_set_host_load_module_source_callback(
+    qts_host_load_module_source_callback_t callback) {
+  qts_host_load_module_source_callback = callback;
+}
+
+void qts_set_host_normalize_module_callback(
+    qts_host_normalize_module_callback_t callback) {
+  qts_host_normalize_module_callback = callback;
+}
+
+void qts_set_host_ref_free_callback(qts_host_ref_free_callback_t callback) {
+  qts_host_ref_free_callback = callback;
+}
+
+JSValue *qts_host_call_function(
+    JSContext *ctx, JSValueConst *this_ptr, int argc, JSValueConst *argv, HostRefId host_ref_id) {
+  if (!qts_host_call_function_callback) {
+    return NULL;
+  }
+  return qts_host_call_function_callback(ctx, this_ptr, argc, argv, host_ref_id);
+}
+
+int qts_host_interrupt_handler(JSRuntime *rt) {
+  if (!qts_host_interrupt_handler_callback) {
+    return 0;
+  }
+  return qts_host_interrupt_handler_callback(rt);
+}
+
+char *qts_host_load_module_source(
+    JSRuntime *rt, JSContext *ctx, const char *module_name) {
+  if (!qts_host_load_module_source_callback) {
+    return NULL;
+  }
+  return qts_host_load_module_source_callback(rt, ctx, module_name);
+}
+
+char *qts_host_normalize_module(
+    JSRuntime *rt, JSContext *ctx, const char *module_base_name, const char *module_name) {
+  if (!qts_host_normalize_module_callback) {
+    return NULL;
+  }
+  return qts_host_normalize_module_callback(rt, ctx, module_base_name, module_name);
+}
+
+void qts_host_ref_free(JSRuntime *rt, HostRefId id) {
+  if (qts_host_ref_free_callback) {
+    qts_host_ref_free_callback(rt, id);
+  }
+}
 #endif
 
 typedef struct qts_RuntimeData {
@@ -505,9 +598,7 @@ EM_JS(void, qts_host_ref_free, (JSRuntime *rt, int32_t id), {
 static void host_ref_finalizer(JSRuntime *rt, JSValue val) {
   HostRef *hv = JS_GetOpaque(val, host_ref_class_id);
   if (hv) {
-#ifdef __EMSCRIPTEN__
     qts_host_ref_free(rt, hv->id);
-#endif
     js_free_rt(rt, hv);
   }
 }
@@ -659,6 +750,10 @@ JSContext *QTS_NewContext(JSRuntime *rt, IntrinsicsFlags intrinsics) {
   }
 
   return ctx;
+}
+
+void QTS_AddStdHelpers(JSContext *ctx) {
+  js_std_add_helpers(ctx, 0, NULL);
 }
 
 void QTS_FreeContext(JSContext *ctx) {
@@ -1519,6 +1614,9 @@ char *qts_normalize_module(JSContext *ctx, const char *module_base_name, const c
     qts_log(msg);
   }
   char *em_module_name = qts_host_normalize_module(rt, ctx, module_base_name, module_name);
+  if (em_module_name == NULL) {
+    return NULL;
+  }
   char *js_module_name = js_strdup(ctx, em_module_name);
   free(em_module_name);
   return js_module_name;
