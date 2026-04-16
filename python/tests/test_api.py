@@ -23,6 +23,7 @@ class FakeFFI:
         self.freed_values = []
         self.freed_contexts = []
         self.freed_runtimes = []
+        self.add_std_helpers_calls = []
 
     def _ptr(self) -> int:
         self.next_ptr += 1
@@ -49,7 +50,7 @@ class FakeFFI:
         return self._ptr()
 
     def QTS_AddStdHelpers(self, ctx: int) -> None:
-        _ = ctx
+        self.add_std_helpers_calls.append(ctx)
 
     def QTS_FreeContext(self, ctx: int) -> None:
         self.freed_contexts.append(ctx)
@@ -104,6 +105,20 @@ class TestApi(unittest.TestCase):
         module = get_quickjs(ffi=ffi)
         result = module.eval_code("1 + 1")
         self.assertEqual(result, {"ok": True})
+
+    def test_new_context_adds_std_helpers_by_default(self) -> None:
+        ffi = FakeFFI()
+        module = get_quickjs(ffi=ffi)
+        with module.new_context():
+            pass
+        self.assertEqual(len(ffi.add_std_helpers_calls), 1)
+
+    def test_new_context_can_disable_std_helpers(self) -> None:
+        ffi = FakeFFI()
+        module = get_quickjs(ffi=ffi)
+        with module.new_context(add_helpers=False):
+            pass
+        self.assertEqual(len(ffi.add_std_helpers_calls), 0)
 
     def test_unwrap_raises_on_error(self) -> None:
         class ErrorFFI(FakeFFI):

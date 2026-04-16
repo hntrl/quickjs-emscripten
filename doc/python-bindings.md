@@ -1,6 +1,6 @@
 # Python Bindings Design for quickjs-emscripten
 
-Status: proposal
+Status: in progress
 
 Implemented so far (initial scaffold milestones):
 
@@ -8,6 +8,21 @@ Implemented so far (initial scaffold milestones):
 - CI workflow for Python package build/import checks.
 - Generated low-level sync FFI protocol from `c/interface.c` (`QTS_*` surface).
 - Initial `ctypes` FFI loader and partial sync module/runtime/context API.
+- Native (non-Emscripten) host callback shim in `c/interface.c` for:
+  `callFunction`, interrupt handler, module load/normalize, and host-ref finalizer.
+- `QTS_AddStdHelpers` export and Python `add_helpers` toggle on `new_context()`.
+
+## Problem To Resolve Now
+
+We want Python to match JS host-global behavior:
+
+- JS behavior today: no host APIs by default (for example `console` is absent until
+  caller injects it in that context).
+- Python behavior today: `new_context()` enables std helpers by default, so
+  `console.log` exists automatically.
+
+The user requirement is to move Python to JS-style host API injection over existing C
+bindings, not rely on std-helper defaults.
 
 ## Goal
 
@@ -20,6 +35,19 @@ Add Python bindings that reuse the existing `QTS_*` C interface and expose a Pyt
 - Avoid large C refactors; isolate any C changes to callback plumbing.
 - Preserve support for both bellard/quickjs and quickjs-ng (same current compatibility model).
 
+## Decision: JS-Parity Host Global Model
+
+1. Default context behavior in Python must be "no host APIs", matching JS.
+2. Host globals (including `console`) should be provided by Python wrappers building
+   JS objects/functions in-context, via existing `QTS_*` primitives.
+3. `QTS_AddStdHelpers` remains available as an explicit opt-in convenience path, not
+   the default.
+
+This keeps language intrinsics and host globals separate:
+
+- Intrinsics/global language objects: controlled by `intrinsics` passed to `QTS_NewContext`.
+- Host APIs (`console`, host callbacks, module loader hooks): explicit host injection.
+
 ## Current Architecture (Relevant Seams)
 
 1. C boundary is already centralized.
@@ -30,9 +58,10 @@ Add Python bindings that reuse the existing `QTS_*` C interface and expose a Pyt
    - `quickjs-emscripten-core` owns lifetimes, scopes, runtime/context abstractions, and error mapping.
    - Variant packages provide platform-specific FFI/module loaders.
 
-3. Callback path is currently Emscripten-specific.
-   - C -> host callbacks (`callFunction`, interrupt, module loading) are wired through `EM_JS`.
-   - This is the one place where Python cannot directly reuse behavior today.
+3. Callback path now has dual implementations.
+   - Emscripten builds use `EM_JS` callbacks (`Module.callbacks`).
+   - Native builds dispatch to registered callback pointers (`qts_set_host_*`), which
+     Python can bind through `ctypes`.
 
 ## Proposed Architecture
 
@@ -58,26 +87,30 @@ Implement a new Python package group that mirrors the JS layering:
      - `new_context()`
    - Expose sync-first API in phase 1, asyncify later.
 
+### JS-Parity Additions (Python API)
+
+Add Python equivalents for the JS host-interop primitives:
+
+- `QuickJSContext.new_string(value: str) -> QuickJSHandle`
+- `QuickJSContext.new_object(prototype: QuickJSHandle | None = None) -> QuickJSHandle`
+- `QuickJSContext.new_function(name: str | None, fn: Callable[..., QuickJSHandle | QuickJSResult | None], *, is_constructor: bool = False, length: int | None = None) -> QuickJSHandle`
+- `QuickJSContext.set_prop(target: QuickJSHandle, key: str | int | QuickJSHandle, value: QuickJSHandle) -> None`
+- `QuickJSContext.global_object` (cached handle from `QTS_GetGlobalObject`)
+
+Optional convenience (small sugar over the primitives):
+
+- `QuickJSContext.install_console(logger: Callable[..., None] | None = None)` that
+  wires `console.log` using `new_function/new_object/set_prop`.
+
 ## Minimal C Changes
 
-### Why changes are needed
+Most callback shim work is already in place in `c/interface.c`. For this parity step:
 
-Currently, callback mechanisms rely on `EM_JS`, which assumes a JS host object (`Module.callbacks`). A Python host cannot provide these callbacks through that path.
-
-### Proposed change
-
-Add a small host-callback registration shim in `c/interface.c`:
-
-- New setter API to register function pointers for:
-  - host function invocation (`qts_host_call_function` equivalent),
-  - interrupt callback,
-  - module source loader,
-  - module normalizer,
-  - host-ref free finalizer callback.
-- `#ifdef __EMSCRIPTEN__` path remains as-is for current JS behavior.
-- non-Emscripten path calls registered function pointers.
-
-This isolates Python-specific host integration without changing the existing `QTS_*` execution primitives.
+- Prefer no new VM primitives.
+- Reuse existing callback setters (`qts_set_host_*`/`qts_set_host_callbacks`) from
+  Python `ctypes` directly.
+- Only add `QTS_*` wrapper exports if symbol portability issues appear for those
+  setter names on target platforms.
 
 ## Build and Packaging
 
@@ -126,6 +159,14 @@ Core parity targets:
   - property ops (`get_prop`, `set_prop`, `define_prop`, `get_own_property_names`)
   - execution (`eval_code`, `call_function`, `call_method`)
   - conversion helpers (`dump`, `get_number`, `get_string`, `get_bigint`, etc.)
+
+### Parity Policy For Context Defaults
+
+After this spec is implemented:
+
+- `new_context(add_helpers=False)` is the default.
+- `console.log(...)` should fail unless caller injects `console` (same as JS docs/tests).
+- `new_context(add_helpers=True)` remains a convenience opt-in for std helpers.
 
 ## Memory and Lifetime Model
 
@@ -183,20 +224,38 @@ Exit criteria:
 - Python can evaluate code, manipulate values, and enforce memory/stack limits.
 - No callback-dependent features required yet (`new_function`, module loader, interrupt can be stubbed or unsupported).
 
-### Phase 2: callback shim + callback-backed APIs
+### Phase 2: JS-parity host function/property APIs (current next step)
 
-- Add C callback registration shim for non-Emscripten host.
-- Implement Python host callback bridge:
-  - `new_function` host callbacks,
-  - interrupt handlers,
-  - module loader/normalizer.
+Implement host injection primitives and switch defaults:
+
+- Implement context primitives in Python wrapper:
+  - `new_string`, `new_object`, `set_prop`, `global_object`.
+- Implement Python host function bridge for `QTS_NewFunction`:
+  - runtime-scoped `host_ref_id -> callable` registry;
+  - register C callback function pointers via existing native setter APIs;
+  - argument conversion using `QTS_ArgvGetJSValueConstPointer` + dup/handle wrappers;
+  - Python exceptions converted to QuickJS exceptions via `QTS_Throw`.
+- Flip Python default to `add_helpers=False`.
+- Add parity example/tests that inject `console` via Python API, mirroring JS README flow.
+
+Exit criteria:
+
+- `console.log` is absent by default in Python contexts.
+- User can create `console.log` from Python using `new_function/new_object/set_prop`.
+- Python callback-raised exceptions propagate as JS exceptions.
+- Existing eval/basic tests remain green.
+
+### Phase 3: callback-backed runtime features
+
+- Implement interrupt handler and module loader/normalizer bindings in Python on top
+  of the same callback registration path.
 - Add parity tests for callbacks and module loading.
 
 Exit criteria:
 
 - Python callback features match current JS semantics for sync runtime.
 
-### Phase 3: packaging hardening and distribution
+### Phase 4: packaging hardening and distribution
 
 - Build wheels for target OS/arch matrix.
 - Add README usage docs and API reference generation.
@@ -206,7 +265,7 @@ Exit criteria:
 
 - Publishable Python package with tested binaries and stable API docs.
 
-### Phase 4: asyncify and advanced parity
+### Phase 5: asyncify and advanced parity
 
 - Add asyncify-compatible FFI and Python async APIs.
 - Validate async module loading and async host callbacks.
@@ -231,6 +290,20 @@ Exit criteria:
    - wheel artifacts for declared support matrix,
    - package import/test works in clean virtualenv.
 
+## Tests Required For This Spec
+
+1. Default host globals parity:
+   - `ctx.eval_code("typeof console")` yields `"undefined"` when `add_helpers` omitted.
+2. Opt-in helpers still work:
+   - `ctx = module.new_context(add_helpers=True)` allows `console.log(1 + 1)`.
+3. Manual console injection parity:
+   - build `console.log` with Python `new_function/new_object/set_prop`;
+   - `console.log("x")` succeeds.
+4. Host function error path:
+   - Python callback raises; JS call sees exception; `unwrap_result` raises.
+5. Host ref lifecycle:
+   - callback host refs are released on function GC/finalization (`freeHostRef` path).
+
 ## Risks and Mitigations
 
 - Risk: lifetime bugs or double-frees in Python wrapper layer.
@@ -240,7 +313,7 @@ Exit criteria:
   - Mitigation: keep `c/interface.c` declarations as single source and generate Python + TS bindings from the same parser path.
 
 - Risk: scope creep from asyncify early.
-  - Mitigation: strict sync-first milestone; asyncify explicitly phase 4.
+  - Mitigation: strict sync-first milestone; asyncify explicitly phase 5.
 
 ## Open Questions
 

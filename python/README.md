@@ -11,6 +11,15 @@ Current status:
   (`new_runtime`, `new_context`, `eval_code`, `unwrap_result`, `dump`, number/string helpers);
 - initial ctypes loader exists via `quickjs_emscripten.load_ctypes_ffi(...)`.
 
+Behavior notes:
+
+- `module.new_context()` currently calls `QTS_AddStdHelpers` by default, so helpers
+  like `console.log(...)` are available out of the box.
+- To match the JS package's "no host APIs by default" behavior, pass
+  `add_helpers=False` when creating a context.
+- This only affects host helpers; QuickJS language intrinsics/globals are still
+  controlled by the `intrinsics` flags passed to `QTS_NewContext`.
+
 Regenerate the protocol from `c/interface.c`:
 
 ```bash
